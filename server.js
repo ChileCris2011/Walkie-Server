@@ -305,6 +305,85 @@ io.on('connection', (socket) => {
     }
   });
 
+  // WebRTC Signaling (Señalización)
+  
+  // Usuario crea una oferta WebRTC
+  socket.on('webrtc-offer', ({ channelId, userId, offer }) => {
+    console.log(`📤 WebRTC offer from ${userId} in channel ${channelId}`);
+    
+    // Reenviar oferta a todos los demás en el canal
+    socket.to(channelId).emit('webrtc-offer', {
+      userId,
+      offer
+    });
+  });
+
+  // Usuario responde con answer
+  socket.on('webrtc-answer', ({ channelId, userId, answer, targetUserId }) => {
+    console.log(`📤 WebRTC answer from ${userId} to ${targetUserId}`);
+    
+    // Enviar answer específicamente al usuario objetivo
+    const channel = channels.get(channelId);
+    if (channel) {
+      const targetUser = Array.from(channel.users.values()).find(
+        u => u.userId === targetUserId
+      );
+      
+      if (targetUser) {
+        io.to(targetUser.socketId).emit('webrtc-answer', {
+          userId,
+          answer
+        });
+      }
+    }
+  });
+
+  // ICE Candidate exchange
+  socket.on('webrtc-ice-candidate', ({ channelId, userId, candidate, targetUserId }) => {
+    console.log(`🧊 ICE candidate from ${userId}`);
+    
+    if (targetUserId) {
+      // Enviar a usuario específico
+      const channel = channels.get(channelId);
+      if (channel) {
+        const targetUser = Array.from(channel.users.values()).find(
+          u => u.userId === targetUserId
+        );
+        
+        if (targetUser) {
+          io.to(targetUser.socketId).emit('webrtc-ice-candidate', {
+            userId,
+            candidate
+          });
+        }
+      }
+    } else {
+      // Broadcast a todos en el canal
+      socket.to(channelId).emit('webrtc-ice-candidate', {
+        userId,
+        candidate
+      });
+    }
+  });
+
+  // Solicitar conexión WebRTC con usuario específico
+  socket.on('request-webrtc-connection', ({ channelId, userId, targetUserId }) => {
+    console.log(`🤝 ${userId} requesting WebRTC connection with ${targetUserId}`);
+    
+    const channel = channels.get(channelId);
+    if (channel) {
+      const targetUser = Array.from(channel.users.values()).find(
+        u => u.userId === targetUserId
+      );
+      
+      if (targetUser) {
+        io.to(targetUser.socketId).emit('webrtc-connection-request', {
+          userId
+        });
+      }
+    }
+  });
+
   // Desconexión
   socket.on('disconnect', () => {
     console.log(`❌ User disconnected: ${socket.id}`);
