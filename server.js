@@ -1,11 +1,8 @@
-// server.js - Backend para Walkie-Talkie con Socket.io
+// server.js - Backend WebRTC para Walkie-Talkie con Socket.io
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-const multer = require('multer');
 
 const app = express();
 const server = http.createServer(app);
@@ -14,73 +11,24 @@ const io = socketIo(server, {
     origin: '*',
     methods: ['GET', 'POST']
   },
-  maxHttpBufferSize: 10e6, // 10MB para audio
+  maxHttpBufferSize: 10e6,
   pingTimeout: 60000,
   pingInterval: 25000
 });
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// Crear directorio para almacenar audio temporal
-const audioDir = path.join(__dirname, 'audio_temp');
-if (!fs.existsSync(audioDir)) {
-  fs.mkdirSync(audioDir);
-}
-
-// Servir archivos de audio
-app.use('/audio', express.static(audioDir));
-
-// Configurar multer para subir archivos
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, audioDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueName = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}.m4a`;
-    cb(null, uniqueName);
-  }
-});
-
-const upload = multer({ 
-  storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
-});
 
 // Almacenamiento en memoria
 const channels = new Map();
 const users = new Map();
 
-// Limpiar archivos de audio antiguos (más de 1 hora)
-setInterval(() => {
-  const now = Date.now();
-  const oneHour = 60 * 60 * 1000;
-  
-  fs.readdir(audioDir, (err, files) => {
-    if (err) return;
-    
-    files.forEach(file => {
-      const filePath = path.join(audioDir, file);
-      fs.stat(filePath, (err, stats) => {
-        if (err) return;
-        
-        if (now - stats.mtimeMs > oneHour) {
-          fs.unlink(filePath, err => {
-            if (!err) console.log(`🗑️ Deleted old audio file: ${file}`);
-          });
-        }
-      });
-    });
-  });
-}, 5 * 60 * 1000); // Cada 5 minutos
-
 // Endpoints HTTP
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok',
-    message: '🎙️ Walkie-Talkie Server Running',
-    version: '1.0.0',
+    message: '🎙️ Walkie-Talkie WebRTC Server Running',
+    version: '2.0.0 (WebRTC)',
     channels: channels.size,
     users: users.size,
     timestamp: new Date().toISOString()
@@ -103,43 +51,14 @@ app.get('/channels', (req, res) => {
     userCount: data.users.size,
     users: Array.from(data.users.values()).map(u => ({
       userId: u.userId,
+      socketId: u.socketId,
       joinedAt: u.joinedAt
     }))
   }));
   res.json(channelList);
 });
 
-// Endpoint para subir audio (alternativa a Socket.io para archivos grandes)
-app.post('/upload-audio', upload.single('audio'), (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No audio file provided' });
-    }
-
-    const audioUrl = `/audio/${req.file.filename}`;
-    const { channelId, userId } = req.body;
-
-    console.log(`📤 Audio uploaded by ${userId} for channel ${channelId}`);
-
-    // Notificar a usuarios del canal
-    io.to(channelId).emit('audio-message', {
-      userId,
-      audioUrl: `${req.protocol}://${req.get('host')}${audioUrl}`,
-      timestamp: Date.now()
-    });
-
-    res.json({ 
-      success: true, 
-      audioUrl,
-      filename: req.file.filename
-    });
-  } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: 'Upload failed' });
-  }
-});
-
-// Socket.io
+// Socket.io - Manejo de señalización WebRTC
 io.on('connection', (socket) => {
   console.log(`✅ User connected: ${socket.id}`);
   
@@ -150,7 +69,6 @@ io.on('connection', (socket) => {
     userId: null
   });
 
-  // Enviar mensaje de bienvenida
   socket.emit('connected', { 
     socketId: socket.id,
     timestamp: Date.now()
@@ -226,68 +144,76 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Transmisión de audio via base64 (para chunks pequeños)
-  socket.on('audio-data', (data) => {
-    const { channelId, userId, audioData, timestamp } = data;
-    
-    console.log(`🎤 ${userId} sending audio to channel ${channelId} (${audioData ? audioData.length : 0} bytes)`);
-    
-    // Reenviar audio a todos excepto al emisor
-    socket.to(channelId).emit('audio-received', {
-      userId,
-      audioData,
-      timestamp: timestamp || Date.now()
-    });
+  // ========== SEÑALIZACIÓN WEBRTC ==========
 
-    // Incrementar contador de mensajes
-    const channel = channels.get(channelId);
-    if (channel) {
-      channel.messageCount++;
+  // Reenviar oferta WebRTC
+  socket.on('webrtc-offer', ({ to, offer }) => {
+    console.log(`📤 WebRTC offer from ${socket.id} to ${to}`);
+    
+    // Encontrar el socketId del usuario destino
+    const targetSocketId = findSocketIdByUserId(to);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('webrtc-offer', {
+        from: users.get(socket.id)?.userId || socket.id,
+        offer: offer
+      });
+    } else {
+      console.log(`❌ User ${to} not found for WebRTC offer`);
     }
   });
 
-  // Transmisión de audio via URL (después de subirlo)
-  socket.on('audio-url', (data) => {
-    const { channelId, userId, audioUrl, timestamp } = data;
+  // Reenviar respuesta WebRTC
+  socket.on('webrtc-answer', ({ to, answer }) => {
+    console.log(`📤 WebRTC answer from ${socket.id} to ${to}`);
     
-    console.log(`🎤 ${userId} sharing audio URL to channel ${channelId}: ${audioUrl}`);
-    
-    socket.to(channelId).emit('audio-message', {
-      userId,
-      audioUrl,
-      timestamp: timestamp || Date.now()
-    });
-
-    const channel = channels.get(channelId);
-    if (channel) {
-      channel.messageCount++;
+    const targetSocketId = findSocketIdByUserId(to);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('webrtc-answer', {
+        from: users.get(socket.id)?.userId || socket.id,
+        answer: answer
+      });
+    } else {
+      console.log(`❌ User ${to} not found for WebRTC answer`);
     }
   });
+
+  // Reenviar candidato ICE
+  socket.on('ice-candidate', ({ to, candidate }) => {
+    const targetSocketId = findSocketIdByUserId(to);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('ice-candidate', {
+        from: users.get(socket.id)?.userId || socket.id,
+        candidate: candidate
+      });
+    }
+  });
+
+  // ========== SEÑALES DE TRANSMISIÓN ==========
 
   // Señal de inicio de transmisión
   socket.on('transmission-start', ({ channelId, userId }) => {
     console.log(`🔴 ${userId} started transmission in ${channelId}`);
-    socket.to(channelId).emit('transmission-start', { userId, timestamp: Date.now() });
+    socket.to(channelId).emit('transmission-start', { 
+      userId, 
+      timestamp: Date.now() 
+    });
+
+    const channel = channels.get(channelId);
+    if (channel) {
+      channel.messageCount++;
+    }
   });
 
   // Señal de fin de transmisión
   socket.on('transmission-end', ({ channelId, userId }) => {
     console.log(`⏹️ ${userId} ended transmission in ${channelId}`);
-    socket.to(channelId).emit('transmission-end', { userId, timestamp: Date.now() });
-  });
-
-  // Streaming de audio en chunks (para baja latencia)
-  socket.on('audio-chunk', (data) => {
-    const { channelId, chunk, sequence } = data;
-    
-    // Reenviar chunk inmediatamente sin logging (para evitar spam)
-    socket.to(channelId).emit('audio-chunk', {
-      userId: users.get(socket.id)?.userId,
-      chunk,
-      sequence,
-      timestamp: Date.now()
+    socket.to(channelId).emit('transmission-end', { 
+      userId, 
+      timestamp: Date.now() 
     });
   });
+
+  // ========== UTILIDADES ==========
 
   // Ping/pong para mantener conexión
   socket.on('ping', () => {
@@ -302,85 +228,6 @@ io.on('connection', (socket) => {
       socket.emit('channel-users', userList);
     } else {
       socket.emit('channel-users', []);
-    }
-  });
-
-  // WebRTC Signaling (Señalización)
-  
-  // Usuario crea una oferta WebRTC
-  socket.on('webrtc-offer', ({ channelId, userId, offer }) => {
-    console.log(`📤 WebRTC offer from ${userId} in channel ${channelId}`);
-    
-    // Reenviar oferta a todos los demás en el canal
-    socket.to(channelId).emit('webrtc-offer', {
-      userId,
-      offer
-    });
-  });
-
-  // Usuario responde con answer
-  socket.on('webrtc-answer', ({ channelId, userId, answer, targetUserId }) => {
-    console.log(`📤 WebRTC answer from ${userId} to ${targetUserId}`);
-    
-    // Enviar answer específicamente al usuario objetivo
-    const channel = channels.get(channelId);
-    if (channel) {
-      const targetUser = Array.from(channel.users.values()).find(
-        u => u.userId === targetUserId
-      );
-      
-      if (targetUser) {
-        io.to(targetUser.socketId).emit('webrtc-answer', {
-          userId,
-          answer
-        });
-      }
-    }
-  });
-
-  // ICE Candidate exchange
-  socket.on('webrtc-ice-candidate', ({ channelId, userId, candidate, targetUserId }) => {
-    console.log(`🧊 ICE candidate from ${userId}`);
-    
-    if (targetUserId) {
-      // Enviar a usuario específico
-      const channel = channels.get(channelId);
-      if (channel) {
-        const targetUser = Array.from(channel.users.values()).find(
-          u => u.userId === targetUserId
-        );
-        
-        if (targetUser) {
-          io.to(targetUser.socketId).emit('webrtc-ice-candidate', {
-            userId,
-            candidate
-          });
-        }
-      }
-    } else {
-      // Broadcast a todos en el canal
-      socket.to(channelId).emit('webrtc-ice-candidate', {
-        userId,
-        candidate
-      });
-    }
-  });
-
-  // Solicitar conexión WebRTC con usuario específico
-  socket.on('request-webrtc-connection', ({ channelId, userId, targetUserId }) => {
-    console.log(`🤝 ${userId} requesting WebRTC connection with ${targetUserId}`);
-    
-    const channel = channels.get(channelId);
-    if (channel) {
-      const targetUser = Array.from(channel.users.values()).find(
-        u => u.userId === targetUserId
-      );
-      
-      if (targetUser) {
-        io.to(targetUser.socketId).emit('webrtc-connection-request', {
-          userId
-        });
-      }
     }
   });
 
@@ -411,6 +258,16 @@ io.on('connection', (socket) => {
   });
 });
 
+// Función auxiliar para encontrar socketId por userId
+function findSocketIdByUserId(userId) {
+  for (const [socketId, user] of users.entries()) {
+    if (user.userId === userId) {
+      return socketId;
+    }
+  }
+  return null;
+}
+
 // Limpieza periódica de canales vacíos
 setInterval(() => {
   let cleaned = 0;
@@ -429,35 +286,46 @@ setInterval(() => {
 setInterval(() => {
   const totalMessages = Array.from(channels.values())
     .reduce((sum, ch) => sum + (ch.messageCount || 0), 0);
+  
+  const channelStats = Array.from(channels.entries()).map(([id, ch]) => ({
+    id,
+    users: ch.users.size,
+    messages: ch.messageCount
+  }));
+
   console.log(`📊 Stats - Channels: ${channels.size}, Users: ${users.size}, Total Messages: ${totalMessages}`);
+  if (channelStats.length > 0) {
+    console.log('Active channels:', channelStats);
+  }
 }, 300000);
 
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => {
-  const address = server.address();
   console.log(`
-╔════════════════════════════════════════╗
-║   🎙️  Walkie-Talkie Server Running   ║
-╠════════════════════════════════════════╣
-║   Port: ${PORT.toString().padEnd(29)} ║
-║   Host: 0.0.0.0${' '.repeat(22)} ║
-║   Time: ${new Date().toLocaleTimeString().padEnd(29)} ║
-╠════════════════════════════════════════╣
-║   Endpoints:                           ║
-║   GET  /                               ║
-║   GET  /health                         ║
-║   GET  /channels                       ║
-║   POST /upload-audio                   ║
-╚════════════════════════════════════════╝
+╔═══════════════════════════════════════════╗
+║   🎙️  Walkie-Talkie WebRTC Server       ║
+╠═══════════════════════════════════════════╣
+║   Port: ${PORT.toString().padEnd(33)} ║
+║   Host: 0.0.0.0${' '.repeat(28)} ║
+║   Mode: WebRTC P2P + Relay${' '.repeat(15)} ║
+║   Time: ${new Date().toLocaleTimeString().padEnd(33)} ║
+╠═══════════════════════════════════════════╣
+║   Endpoints:                              ║
+║   GET  /                                  ║
+║   GET  /health                            ║
+║   GET  /channels                          ║
+╠═══════════════════════════════════════════╣
+║   WebRTC Signaling:                       ║
+║   • webrtc-offer                          ║
+║   • webrtc-answer                         ║
+║   • ice-candidate                         ║
+║   • transmission-start/end                ║
+╚═══════════════════════════════════════════╝
 
-📡 WebSocket ready on ws://0.0.0.0:${PORT}
+🔊 WebSocket ready on ws://0.0.0.0:${PORT}
+🌐 Audio streaming via WebRTC (low latency)
   `);
-  
-  console.log('💡 Para probar localmente, usa una de estas URLs:');
-  console.log(`   - http://localhost:${PORT}`);
-  console.log(`   - http://192.168.x.x:${PORT} (reemplaza con tu IP local)`);
-  console.log('');
 });
 
 // Manejo de errores
@@ -481,16 +349,6 @@ function shutdown() {
   
   server.close(() => {
     console.log('✅ Server closed');
-    
-    // Limpiar archivos temporales
-    fs.readdir(audioDir, (err, files) => {
-      if (!err) {
-        files.forEach(file => {
-          fs.unlink(path.join(audioDir, file), () => {});
-        });
-      }
-    });
-    
     process.exit(0);
   });
   
