@@ -151,14 +151,19 @@ io.on('connection', (socket) => {
     console.log(`📤 WebRTC offer from ${socket.id} to ${to}`);
     
     // Encontrar el socketId del usuario destino
-    const targetSocketId = findSocketIdByUserId(to);
-    if (targetSocketId) {
+    const targetUser = Array.from(users.entries()).find(([sid, user]) => user.userId === to);
+    
+    if (targetUser) {
+      const [targetSocketId, targetUserData] = targetUser;
+      console.log(`✅ Found target: ${to} with socket ${targetSocketId}`);
+      
       io.to(targetSocketId).emit('webrtc-offer', {
         from: users.get(socket.id)?.userId || socket.id,
         offer: offer
       });
     } else {
       console.log(`❌ User ${to} not found for WebRTC offer`);
+      console.log(`Available users:`, Array.from(users.values()).map(u => u.userId));
     }
   });
 
@@ -166,8 +171,12 @@ io.on('connection', (socket) => {
   socket.on('webrtc-answer', ({ to, answer }) => {
     console.log(`📤 WebRTC answer from ${socket.id} to ${to}`);
     
-    const targetSocketId = findSocketIdByUserId(to);
-    if (targetSocketId) {
+    const targetUser = Array.from(users.entries()).find(([sid, user]) => user.userId === to);
+    
+    if (targetUser) {
+      const [targetSocketId, targetUserData] = targetUser;
+      console.log(`✅ Found target: ${to} with socket ${targetSocketId}`);
+      
       io.to(targetSocketId).emit('webrtc-answer', {
         from: users.get(socket.id)?.userId || socket.id,
         answer: answer
@@ -179,8 +188,10 @@ io.on('connection', (socket) => {
 
   // Reenviar candidato ICE
   socket.on('ice-candidate', ({ to, candidate }) => {
-    const targetSocketId = findSocketIdByUserId(to);
-    if (targetSocketId) {
+    const targetUser = Array.from(users.entries()).find(([sid, user]) => user.userId === to);
+    
+    if (targetUser) {
+      const [targetSocketId] = targetUser;
       io.to(targetSocketId).emit('ice-candidate', {
         from: users.get(socket.id)?.userId || socket.id,
         candidate: candidate
@@ -257,16 +268,6 @@ io.on('connection', (socket) => {
     console.error(`Socket error for ${socket.id}:`, error);
   });
 });
-
-// Función auxiliar para encontrar socketId por userId
-function findSocketIdByUserId(userId) {
-  for (const [socketId, user] of users.entries()) {
-    if (user.userId === userId) {
-      return socketId;
-    }
-  }
-  return null;
-}
 
 // Limpieza periódica de canales vacíos
 setInterval(() => {
