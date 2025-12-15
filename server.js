@@ -1,19 +1,21 @@
-// server.js - Backend WebRTC para Walkie-Talkie con Socket.io
+// server-webrtc.js - Backend WebRTC para Walkie-Talkie con Socket.io
 const express = require('express');
 const http = require('http');
-const socketIo = require('socket.io');
+const { Server } = require('socket.io');
 const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server, {
+const io = new Server(server, {
   cors: {
     origin: '*',
-    methods: ['GET', 'POST']
+    methods: ['GET', 'POST'],
+    credentials: true
   },
   maxHttpBufferSize: 10e6,
   pingTimeout: 60000,
-  pingInterval: 25000
+  pingInterval: 25000,
+  transports: ['websocket', 'polling']
 });
 
 app.use(cors());
@@ -22,13 +24,14 @@ app.use(express.json({ limit: '10mb' }));
 // Almacenamiento en memoria
 const channels = new Map();
 const users = new Map();
+const peerConnections = new Map(); // Track peer connections per channel
 
 // Endpoints HTTP
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok',
     message: '🎙️ Walkie-Talkie WebRTC Server Running',
-    version: '2.0.0 (WebRTC)',
+    version: '3.0.0 (WebRTC P2P)',
     channels: channels.size,
     users: users.size,
     timestamp: new Date().toISOString()
@@ -41,7 +44,8 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     channels: channels.size,
-    users: users.size
+    users: users.size,
+    activeConnections: io.engine.clientsCount
   });
 });
 
@@ -110,13 +114,16 @@ io.on('connection', (socket) => {
     // Obtener lista de usuarios actuales (excluyendo al que se une)
     const userList = Array.from(channel.users.values())
       .filter(u => u.socketId !== socket.id)
-      .map(u => u.userId);
+      .map(u => ({ userId: u.userId, socketId: u.socketId }));
     
     // Enviar lista de usuarios al que se une
     socket.emit('channel-users', userList);
     
-    // Notificar a otros usuarios
-    socket.to(channelId).emit('user-joined', userId);
+    // Notificar a otros usuarios con socketId para WebRTC
+    socket.to(channelId).emit('user-joined', {
+      userId,
+      socketId: socket.id
+    });
     
     console.log(`✅ ${userId} joined channel ${channelId}. Total users: ${channel.users.size}`);
   });
@@ -129,7 +136,7 @@ io.on('connection', (socket) => {
     if (channel) {
       channel.users.delete(socket.id);
       socket.leave(channelId);
-      socket.to(channelId).emit('user-left', userId);
+      socket.to(channelId).emit('user-left', { userId, socketId: socket.id });
       
       // Eliminar canal si está vacío
       if (channel.users.size === 0) {
@@ -146,57 +153,46 @@ io.on('connection', (socket) => {
 
   // ========== SEÑALIZACIÓN WEBRTC ==========
 
-  // Reenviar oferta WebRTC
-  socket.on('webrtc-offer', ({ to, offer }) => {
-    console.log(`📤 WebRTC offer from ${socket.id} to ${to}`);
+  // Reenviar oferta WebRTC (usar socketId directamente)
+  socket.on('webrtc-offer', ({ to, offer, from }) => {
+    console.log(`📤 WebRTC offer from ${from} to ${to}`);
     
-    // Encontrar el socketId del usuario destino
-    const targetUser = Array.from(users.entries()).find(([sid, user]) => user.userId === to);
-    
-    if (targetUser) {
-      const [targetSocketId, targetUserData] = targetUser;
-      console.log(`✅ Found target: ${to} with socket ${targetSocketId}`);
-      
-      io.to(targetSocketId).emit('webrtc-offer', {
-        from: users.get(socket.id)?.userId || socket.id,
-        offer: offer
-      });
-    } else {
-      console.log(`❌ User ${to} not found for WebRTC offer`);
-      console.log(`Available users:`, Array.from(users.values()).map(u => u.userId));
-    }
+    io.to(to).emit('webrtc-offer', {
+      from: socket.id,
+      fromUserId: from,
+      offer: offer
+    });
   });
 
   // Reenviar respuesta WebRTC
-  socket.on('webrtc-answer', ({ to, answer }) => {
-    console.log(`📤 WebRTC answer from ${socket.id} to ${to}`);
+  socket.on('webrtc-answer', ({ to, answer, from }) => {
+    console.log(`📤 WebRTC answer from ${from} to ${to}`);
     
-    const targetUser = Array.from(users.entries()).find(([sid, user]) => user.userId === to);
-    
-    if (targetUser) {
-      const [targetSocketId, targetUserData] = targetUser;
-      console.log(`✅ Found target: ${to} with socket ${targetSocketId}`);
-      
-      io.to(targetSocketId).emit('webrtc-answer', {
-        from: users.get(socket.id)?.userId || socket.id,
-        answer: answer
-      });
-    } else {
-      console.log(`❌ User ${to} not found for WebRTC answer`);
-    }
+    io.to(to).emit('webrtc-answer', {
+      from: socket.id,
+      fromUserId: from,
+      answer: answer
+    });
   });
 
   // Reenviar candidato ICE
-  socket.on('ice-candidate', ({ to, candidate }) => {
-    const targetUser = Array.from(users.entries()).find(([sid, user]) => user.userId === to);
-    
-    if (targetUser) {
-      const [targetSocketId] = targetUser;
-      io.to(targetSocketId).emit('ice-candidate', {
-        from: users.get(socket.id)?.userId || socket.id,
+  socket.on('ice-candidate', ({ to, candidate, from }) => {
+    if (to && candidate) {
+      io.to(to).emit('ice-candidate', {
+        from: socket.id,
+        fromUserId: from,
         candidate: candidate
       });
     }
+  });
+
+  // Evento de renegociación
+  socket.on('webrtc-renegotiate', ({ to, from }) => {
+    console.log(`🔄 Renegotiation request from ${from} to ${to}`);
+    io.to(to).emit('webrtc-renegotiate', {
+      from: socket.id,
+      fromUserId: from
+    });
   });
 
   // ========== SEÑALES DE TRANSMISIÓN ==========
@@ -205,7 +201,8 @@ io.on('connection', (socket) => {
   socket.on('transmission-start', ({ channelId, userId }) => {
     console.log(`🔴 ${userId} started transmission in ${channelId}`);
     socket.to(channelId).emit('transmission-start', { 
-      userId, 
+      userId,
+      socketId: socket.id,
       timestamp: Date.now() 
     });
 
@@ -219,8 +216,22 @@ io.on('connection', (socket) => {
   socket.on('transmission-end', ({ channelId, userId }) => {
     console.log(`⏹️ ${userId} ended transmission in ${channelId}`);
     socket.to(channelId).emit('transmission-end', { 
-      userId, 
+      userId,
+      socketId: socket.id,
       timestamp: Date.now() 
+    });
+  });
+
+  // ========== FALLBACK: AUDIO DATA RELAY ==========
+  
+  // Para cuando WebRTC no esté disponible o falle
+  socket.on('audio-data', ({ channelId, userId, audioData }) => {
+    console.log(`📢 Relaying audio from ${userId} in ${channelId} (fallback mode)`);
+    socket.to(channelId).emit('audio-received', {
+      userId,
+      socketId: socket.id,
+      audioData,
+      timestamp: Date.now()
     });
   });
 
@@ -235,7 +246,8 @@ io.on('connection', (socket) => {
   socket.on('get-channel-users', ({ channelId }) => {
     const channel = channels.get(channelId);
     if (channel) {
-      const userList = Array.from(channel.users.values()).map(u => u.userId);
+      const userList = Array.from(channel.users.values())
+        .map(u => ({ userId: u.userId, socketId: u.socketId }));
       socket.emit('channel-users', userList);
     } else {
       socket.emit('channel-users', []);
@@ -251,7 +263,10 @@ io.on('connection', (socket) => {
       const channel = channels.get(user.currentChannel);
       if (channel) {
         channel.users.delete(socket.id);
-        socket.to(user.currentChannel).emit('user-left', user.userId);
+        socket.to(user.currentChannel).emit('user-left', {
+          userId: user.userId,
+          socketId: socket.id
+        });
         
         if (channel.users.size === 0) {
           channels.delete(user.currentChannel);
@@ -322,10 +337,12 @@ server.listen(PORT, '0.0.0.0', () => {
 ║   • webrtc-answer                         ║
 ║   • ice-candidate                         ║
 ║   • transmission-start/end                ║
+║   • audio-data (fallback)                 ║
 ╚═══════════════════════════════════════════╝
 
-🔊 WebSocket ready on ws://0.0.0.0:${PORT}
+📊 WebSocket ready on ws://0.0.0.0:${PORT}
 🌐 Audio streaming via WebRTC (low latency)
+🔄 Fallback relay mode available
   `);
 });
 
